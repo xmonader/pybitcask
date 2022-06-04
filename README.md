@@ -19,4 +19,5 @@ Implementation of the [bitcask paper](https://riak.com/assets/bitcask-intro.pdf)
 - [x] Keydir
 - [x] Offline compaction
 - [] Inprocess compaction
+- [] Locking dirs to only one process. always.
 
