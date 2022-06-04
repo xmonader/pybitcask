@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "pybitcask"
+# packages = [{ include = "pybitcask" }]
+version = "0.1.0"
+description = "naive bitcask implementation in python"
+authors = ["xmonader <xmonader@gmail.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+pdoc3 = "^0.6.3"
+
+
+[tool.poetry.dev-dependencies]
+ipython = "^7.6"
+ipdb = "^0.12.1"
+black = {version = "^18.3-alpha.0", allow-prereleases = true}
+flake8 = "^3.7"
+parameterized = "^0.7.0"
+pytest = "^5.0"
+codecov = "^2.0"
+hypothesis = "^4.28"
+pytest-cov = "^2.7"
+objgraph = "^3.4.1"
+
+[tool.black]
+line-length = 120
+target_version = ['py37']
+
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.masonry.api"
