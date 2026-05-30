@@ -7,9 +7,11 @@ import glob
 import os
 import pickle
 
+
 def removeprefix(self: str, prefix: str, /) -> str:
     return self[len(prefix):] if self.startswith(prefix) else self[:]
-        
+
+
 def removesuffix(self: str, suffix: str, /) -> str:
     # suffix='' should not call self[:-0].
     return self[:-len(suffix)] if suffix and self.endswith(suffix) else self[:]
@@ -30,21 +32,18 @@ class Entry:
     key: bytes
     value: bytes
 
-    def __init__(self, key, value):
+    def __init__(self, key, value, timestamp=None, crc=None):
         self.key = key
         self.value = value
         self.key_size = len(key)
         self.value_size = len(value)
-        # print(f"+++++KEY SIZE {self.key_size} VAL SIZE {self.value_size}")
-
-        self.timestamp = int(time.time())
-        self.crc = crc32(self.value)
+        self.timestamp = timestamp if timestamp is not None else int(time.time())
+        self.crc = crc if crc is not None else crc32(self.value)
 
     def encode_entry(self):
         header = struct.pack(ENTRY_HEADER_FORMAT, self.crc,
                              self.timestamp, self.key_size, self.value_size)
         data = b"".join([self.key, self.value])
-        # print(f"ENCODING DATA, {self} and its size is ", ENTRY_HEADER_SIZE + len(data))
         return header + data
 
     def __repr__(self):
@@ -52,23 +51,30 @@ class Entry:
 
     @staticmethod
     def decode_entry(entry_data):
-        # print("TYPE: ", type(entry_data))
         crc, timestamp, key_size, value_size = struct.unpack(
             ENTRY_HEADER_FORMAT, entry_data[:ENTRY_HEADER_SIZE])
         key_bytes = entry_data[ENTRY_HEADER_SIZE:ENTRY_HEADER_SIZE+key_size]
         value_bytes = entry_data[ENTRY_HEADER_SIZE+key_size:]
-        assert crc == crc32(value_bytes)
-        return Entry(key_bytes, value_bytes)
+        assert crc == crc32(value_bytes), "CRC mismatch decoding entry"
+        return Entry(key_bytes, value_bytes, timestamp=timestamp, crc=crc)
 
     @staticmethod
     def decode_header(header_data):
         crc, timestamp, key_size, value_size = struct.unpack(
             ENTRY_HEADER_FORMAT, header_data[:ENTRY_HEADER_SIZE])
-        # print(f"decoded HEADER: CRC {crc} {timestamp} {key_size} {value_size} ", "LEN HEADER: ", len(header_data))
         return crc, timestamp, key_size, value_size
 
     def __len__(self):
         return ENTRY_HEADER_SIZE + len(self.key) + len(self.value)
+
+    def __eq__(self, other):
+        if not isinstance(other, Entry):
+            return False
+        return (self.key == other.key and self.value == other.value
+                and self.key_size == other.key_size
+                and self.value_size == other.value_size
+                and self.crc == other.crc
+                and self.timestamp == other.timestamp)
 
 
 @dataclass
@@ -105,7 +111,7 @@ class KeyDir:
     def load_from_file(file_path):
         assert file_path.endswith(".hint")
         with open(file_path, "rb") as f:
-            KeyDir(pickle.load(f))
+            return KeyDir(pickle.load(f))
 
     def merge(self, other):
         if other:
@@ -123,8 +129,9 @@ class DataFile:
         self.data_dir = data_dir
         self.file_id = file_id
         self.fp = open(self.file_path, 'a+b')
-        # print(f"FILEPATH {self.file_path}")
-        self.writepos = 0
+        # Set writepos to the end of any existing file data
+        self.fp.seek(0, 2)  # SEEK_END
+        self.writepos = self.fp.tell()
 
     @property
     def file_name(self):
@@ -139,27 +146,27 @@ class DataFile:
         entry = Entry(key, value)
         data = entry.encode_entry()
         pos_to_return = self.writepos
-        # print(f"WRITING {data} of size {len(entry)}")
         self._ensure_write(data)
         self.writepos += len(entry)
         return pos_to_return
 
     def _ensure_write(self, data):
-
         self.fp.write(data)
         self.fp.flush()
         os.fsync(self.fp.fileno())
 
-    def get(self, at_idx:int):
+    def get(self, at_idx: int):
         self.fp.seek(at_idx, 0)
-        # print(f"===AT IDX {at_idx}")
         header_data = self.fp.read(ENTRY_HEADER_SIZE)
-        crc, timestamp, key_size, value_size = Entry.decode_header(
-            header_data)
-        # print("++++DATA: ", crc, timestamp, key_size, value_size)
+        if not header_data or len(header_data) < ENTRY_HEADER_SIZE:
+            return b""
+        crc, timestamp, key_size, value_size = Entry.decode_header(header_data)
         key_bytes = self.fp.read(key_size)
-        # print(f"key: {key_bytes}, value: {value_bytes}")
-        return self.fp.read(value_size)
+        value_bytes = self.fp.read(value_size)
+        # Verify CRC — if corrupted or partial, return empty
+        if crc != crc32(value_bytes):
+            return b""
+        return value_bytes
 
     def size(self):
         return self.writepos
@@ -179,18 +186,16 @@ class DataFile:
     def entries(self):
         self.fp.seek(0)
         while True:
+            entry_start = self.fp.tell()  # position BEFORE the header
             header_data = self.fp.read(ENTRY_HEADER_SIZE)
             if not header_data:
                 break
-            crc, timestamp, key_size, value_size = Entry.decode_header(
-                header_data)
-            # print("LISTING ENTRIES DATA: ", crc, timestamp, key_size, value_size)
+            crc, timestamp, key_size, value_size = Entry.decode_header(header_data)
             key_bytes = self.fp.read(key_size)
             value_bytes = self.fp.read(value_size)
-            e = Entry(key_bytes, value_bytes)
-            e.timestamp = timestamp
+            e = Entry(key_bytes, value_bytes, timestamp=timestamp, crc=crc)
             assert e.crc == crc
-            yield e, self.fp.tell()
+            yield e, entry_start
 
 
 @dataclass
@@ -205,10 +210,14 @@ class Bitcask:
         if not os.path.exists(datadir):
             os.makedirs(datadir, exist_ok=True)
         self.datafiles = glob.glob(f"{self.datadir}/*data")
+
         def get_filename_as_int(file_path):
-            f =removeprefix(file_path, f"{self.datadir}/").replace(".data", "")
+            f = removeprefix(file_path, f"{self.datadir}/").replace(".data", "")
             return int(f)
-        def comp(el): return get_filename_as_int(el) 
+
+        def comp(el):
+            return get_filename_as_int(el)
+
         self.datafiles.sort(key=comp, reverse=False)
         self.hints = glob.glob(f"{self.datadir}/*.hint")
         if self.hints:
@@ -229,76 +238,116 @@ class Bitcask:
         for file_path in glob.glob(f"{self.datadir}/*.hint"):
             keydir = KeyDir.load_from_file(file_path)
             globalkeydir.merge(keydir)
-
         return globalkeydir
 
     def _load_keydir(self, no_dead_values=False):
-
         keydir = KeyDir()
-        for datafile_path in self.datafiles:
-
-            datafile_id = removeprefix(datafile_path, f"{self.datadir}/").replace(".data", "")
+        # Sort by file_id so later (higher-numbered) files overwrite earlier ones
+        sorted_datafiles = sorted(
+            self.datafiles,
+            key=lambda p: int(
+                removeprefix(p, f"{self.datadir}/").replace(".data", ""))
+        )
+        for datafile_path in sorted_datafiles:
+            datafile_id = removeprefix(
+                datafile_path, f"{self.datadir}/").replace(".data", "")
             file_id = int(datafile_id)
             datafile = DataFile(file_id, self.datadir)
             for entry, entry_pos in datafile.entries:
-                if no_dead_values and entry.value == TOMBSTONE_VALUE:
+                if entry.value == TOMBSTONE_VALUE:
                     keydir.delete(entry.key)
                     continue
-                keydirentry = KeyDirEntry(datafile.file_id, len(
-                    entry), entry_pos, entry.timestamp, entry.key)
+                keydirentry = KeyDirEntry(datafile.file_id, len(entry),
+                                          entry_pos, entry.timestamp, entry.key)
                 keydir.put(entry.key, keydirentry)
             datafile.close()
         return keydir
 
     def get_activedatafile_id(self):
-
-        return len(self.datafiles)+1
+        return len(self.datafiles) + 1
 
     def get(self, key):
-
         if key not in self.keydir:
-            return ""  # TODO: how do we distinguish between empty value and non existing value?
-        if keydirentry := self.keydir.get(key):
-            file_id = keydirentry.file_id
-            if file_id == self.activedatafile.file_id:
-                return self.activedatafile.get(keydirentry.entry_pos)
+            return b""
+        keydirentry = self.keydir.get(key)
+        if keydirentry is None:
+            return b""
+        file_id = keydirentry.file_id
+        if file_id == self.activedatafile.file_id:
+            return self.activedatafile.get(keydirentry.entry_pos)
+        else:
             datafile = DataFile(file_id, self.datadir)
-            return datafile.get(keydirentry.entry_pos)
+            result = datafile.get(keydirentry.entry_pos)
+            datafile.close()
+            return result
 
     def put(self, key, value):
         entry = Entry(key, value)
-        entry_data = entry.encode_entry()
-        # print(f"AFTER ENCODING: entry_size {len(entry)}, entry_data {entry_data}")
         entry_pos = self.activedatafile.put(key, value)
-        keydirentry = KeyDirEntry(int(self.get_activedatafile_id()), len(entry), entry_pos, entry.timestamp, entry.key)
-        self.keydir.put(key, keydirentry)
+        # Tombstone values are written to disk but NOT inserted into keydir;
+        # the keydir is managed by delete() separately.
+        if value != TOMBSTONE_VALUE:
+            keydirentry = KeyDirEntry(
+                self.activedatafile.file_id, len(entry), entry_pos,
+                entry.timestamp, entry.key)
+            self.keydir.put(key, keydirentry)
         if self.activedatafile.reached_max_size():
-            # print("REACHED MAX SIZE for file", self.activedatafile.file_path)
             self.activedatafile.close()
             self.datafiles.append(self.activedatafile.file_path)
-            self.activedatafile = DataFile(int(self.get_activedatafile_id()), self.datadir)
-            # print("OPENED NEW DATA FILE", self.activedatafile.file_path)
+            self.activedatafile = DataFile(
+                self.get_activedatafile_id(), self.datadir)
 
     def delete(self, key):
-        self.keydir.delete(key)
+        # Write tombstone first, then remove from keydir.
+        # Order matters: if we crash between, a tombstone on disk is harmless.
         self.put(key, TOMBSTONE_VALUE)
+        self.keydir.delete(key)
 
     def compact(self, to_dir_path=".bitcask"):
         os.makedirs(to_dir_path, exist_ok=True)
-        for datafile in self.datafiles:
-            keydir = KeyDir()
-            datafile_id = removeprefix(datafile, f"{self.datadir}/").replace(".data", "")
-            file_id = int(datafile_id)
-            datafile_in = DataFile(file_id, self.datadir)
-            datafile_out = DataFile(file_id, to_dir_path)
-            for entry, _ in datafile_in.entries:
-                if entry.value == TOMBSTONE_VALUE:
-                    keydir.delete(entry.key)
-                    continue
-                entry_pos = datafile_out.put(entry.key, entry.value)
-                keydirentry = KeyDirEntry(datafile_in.file_id, len(
-                    entry), entry_pos, entry.timestamp, entry.key)
-                keydir.put(entry.key, keydirentry)
-            datafile_in.close()
-            datafile_out.close()
-            keydir.save_to_file(f"{to_dir_path}/{str(datafile_out.file_id).zfill(4)}.hint")
+        # Close the active data file so its content is included in compaction
+        self.activedatafile.close()
+        if self.activedatafile.file_path not in self.datafiles and self.activedatafile.size() > 0:
+            self.datafiles.append(self.activedatafile.file_path)
+        # Reopen for any further writes
+        self.activedatafile = DataFile(
+            self.get_activedatafile_id(), self.datadir)
+
+        # Build a single merged keydir from ALL data files (later files
+        # override earlier ones; tombstones delete). This is the same logic
+        # as _load_keydir.
+        merged_keydir = self._load_keydir()
+
+        if not merged_keydir.m:
+            print("Compaction: nothing to compact")
+            return
+
+        # Write a single compacted data file + hint
+        out_file_path = os.path.join(to_dir_path, "0001.data")
+        out_hint_path = os.path.join(to_dir_path, "0001.hint")
+        if os.path.exists(out_file_path):
+            os.remove(out_file_path)
+        if os.path.exists(out_hint_path):
+            os.remove(out_hint_path)
+
+        # Also clean up any stale numbered files from previous compactions
+        for stale in glob.glob(f"{to_dir_path}/*.data"):
+            os.remove(stale)
+        for stale in glob.glob(f"{to_dir_path}/*.hint"):
+            os.remove(stale)
+
+        compact_keydir = KeyDir()
+        datafile_out = DataFile(1, to_dir_path)
+        for key, keydirentry in merged_keydir.m.items():
+            # Read the value from the source data file
+            source_file = DataFile(keydirentry.file_id, self.datadir)
+            value = source_file.get(keydirentry.entry_pos)
+            source_file.close()
+            entry_pos = datafile_out.put(key, value)
+            compact_keydir.put(
+                key,
+                KeyDirEntry(datafile_out.file_id, len(Entry(key, value)),
+                            entry_pos, keydirentry.timestamp, key))
+        datafile_out.close()
+        compact_keydir.save_to_file(out_hint_path)
+        print(f"Compaction done to {to_dir_path}")
